@@ -1,0 +1,7 @@
+services:
+  midi-sustain-api:
+    build: .
+    image: midi-sustain-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
