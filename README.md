@@ -1,8 +1,9 @@
 # MIDI Sustain Parser API
 
-供钢琴教学软件调用的 MIDI 延音解析服务。提交带毫秒时间戳的
+供钢琴教学软件调用的 MIDI 延音解析与练习对齐服务。提交带毫秒时间戳的
 `note_on` / `note_off` / `pedal_down` / `pedal_up` 事件及 `end_ms`，
-返回每次按键的**发声半开区间 `[on_ms, end_ms)`** 及其结束原因。
+既可返回每次按键的**发声半开区间 `[on_ms, end_ms)`** 及其结束原因，
+也可将练习中的 `note_on` 与参考音符做全局序列对齐，定位**漏弹、多弹与时值偏差**。
 
 ## 快速启动
 
@@ -14,6 +15,7 @@ docker compose up --build
 
 - API 地址： `http://localhost:8000`
 - 解析接口： `POST http://localhost:8000/api/v1/parse`
+- 练习对齐接口： `POST http://localhost:8000/api/v1/practice/align`
 - 交互式文档（Swagger UI）： `http://localhost:8000/docs`
 - 健康检查： `GET http://localhost:8000/health`
 - 端口： `8000`（宿主机映射见 `docker-compose.yml`，可改 `"<宿主端口>:8000"`）
@@ -93,6 +95,89 @@ python -m pytest tests/ -q
 | `end_ms` | 发声区间终点（不含） |
 | `end_reason` | `note_off`（松键结束）/ `pedal_up`（延音至抬踏板）/ `end_ms`（持续到结尾） |
 
+### `POST /api/v1/practice/align`
+
+将练习录音与参考乐谱对齐，找出**漏弹**（参考有、没弹）、**多弹**
+（弹了、参考没有）以及每次配对的**时值偏差**。请求沿用 `/api/v1/parse`
+的 `events` / `end_ms` 格式与校验，另附按时间排列的参考音符和容差。
+
+请求体：
+
+```json
+{
+  "end_ms": 4000,
+  "tolerance_ms": 100,
+  "reference_notes": [
+    {"pitch": 60, "time_ms": 100},
+    {"pitch": 64, "time_ms": 300},
+    {"pitch": 67, "time_ms": 500}
+  ],
+  "events": [
+    {"type": "note_on",  "time_ms": 130, "pitch": 60},
+    {"type": "note_off", "time_ms": 400, "pitch": 60},
+    {"type": "note_on",  "time_ms": 490, "pitch": 67}
+  ]
+}
+```
+
+字段约束：
+
+| 字段 | 约束 |
+|---|---|
+| `end_ms` | 整数，`>= 0` |
+| `events[]` | 与 `/api/v1/parse` 完全一致（同样的类型、时间、音高校验） |
+| `reference_notes[].pitch` | 整数 `0 ~ 127` |
+| `reference_notes[].time_ms` | 整数，须在 `0 ~ end_ms` 区间内（含端点）；参考音符按时间先后提交 |
+| `tolerance_ms` | 非负整数；允许配对的最大时间差（毫秒） |
+
+响应（`200 OK`）：
+
+```json
+{
+  "end_ms": 4000,
+  "tolerance_ms": 100,
+  "pair_count": 2,
+  "missed_count": 1,
+  "extra_count": 0,
+  "pairs": [
+    {"reference_index": 0, "event_index": 0, "time_delta_ms": 30},
+    {"reference_index": 2, "event_index": 2, "time_delta_ms": -10}
+  ],
+  "missed_reference_indices": [1],
+  "extra_event_indices": []
+}
+```
+
+| 响应字段 | 含义 |
+|---|---|
+| `pairs[].reference_index` | 配对参考音符在 `reference_notes` 中的下标（从 0 计） |
+| `pairs[].event_index` | 配对的 `note_on` 在请求 `events` 数组中的**原始下标** |
+| `pairs[].time_delta_ms` | **有符号**时值偏差：弹奏时间 − 参考时间；正数弹晚、负数弹早 |
+| `missed_reference_indices` | 漏弹的参考音符下标（按参考顺序） |
+| `extra_event_indices` | 多弹的 `note_on` 原始事件下标（按弹奏时间顺序） |
+| `pair_count` / `missed_count` / `extra_count` | 配对数 / 漏弹数 / 多弹数 |
+
+对齐语义：
+
+- 仅取 `events` 中的 `note_on`，先按 `(time_ms, 原事件序号)` 排序，
+  再与参考音符做**全局序列对齐**（Needleman-Wunsch 式动态规划）。
+- 配对条件：**同音高**且 `|弹奏时间 − 参考时间| <= tolerance_ms`，
+  配对代价为绝对时间差；漏弹、多弹的代价各为 `tolerance_ms + 1`
+  （保证超出容差的配对永远不如"漏弹+多弹"划算）。
+- 选总代价最小的对齐路径；代价相同（同分）时依次优先：
+  **配对 > 漏弹 > 多弹**。
+- `pairs` 按 `reference_index` 升序；`time_delta_ms` 单位毫秒。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/practice/align \
+  -H 'Content-Type: application/json' \
+  -d '{"end_ms":1000,"tolerance_ms":50,
+       "reference_notes":[{"pitch":60,"time_ms":100}],
+       "events":[{"type":"note_on","time_ms":151,"pitch":60}]}'
+# 偏差 51ms 超过容差 50ms => 1 漏弹 + 1 多弹
+# => 200 {"pair_count":0,"missed_reference_indices":[0],"extra_event_indices":[0], ...}
+```
+
 ## 解析语义
 
 - 事件按 `(time_ms, 输入序号)` 排序处理：时间相同则先提交的先处理。
@@ -104,10 +189,12 @@ python -m pytest tests/ -q
 
 ## 错误响应
 
+两个接口（`/api/v1/parse`、`/api/v1/practice/align`）使用同一套事件校验与错误格式：
+
 | 状态码 | 场景 |
 |---|---|
 | `400` | 事件序列语义错误，如 `note_off` 没有对应仍按住的 `note_on`（响应 `detail` 含具体事件下标） |
-| `422` | 请求体校验失败：音高超出 `0~127`、`time_ms` 超出 `0~end_ms`、音符事件缺少 `pitch` 等 |
+| `422` | 请求体校验失败：音高超出 `0~127`、事件或参考音符的 `time_ms` 超出 `0~end_ms`、音符事件缺少 `pitch`、`tolerance_ms` 为负数等 |
 
 示例：
 
@@ -125,8 +212,10 @@ app/
   main.py      # FastAPI 应用与路由
   models.py    # 请求/响应 Pydantic 模型与校验
   sustain.py   # 延音解析核心逻辑（纯标准库，可单测）
+  align.py     # 练习对齐动态规划核心逻辑（纯标准库，可单测）
 tests/
   test_sustain.py
+  test_align.py
 Dockerfile
 docker-compose.yml
 requirements.txt

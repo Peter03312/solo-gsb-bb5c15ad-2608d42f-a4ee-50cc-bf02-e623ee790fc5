@@ -24,6 +24,13 @@ class EventIn(BaseModel):
         return self
 
 
+class ReferenceNoteIn(BaseModel):
+    """One reference note the student was supposed to play."""
+
+    pitch: int = Field(ge=0, le=127, description="MIDI pitch 0-127")
+    time_ms: int = Field(ge=0, description="Reference onset time in milliseconds, within [0, end_ms]")
+
+
 class ParseRequest(BaseModel):
     end_ms: int = Field(ge=0, description="Performance end time in milliseconds")
     events: List[EventIn] = Field(default_factory=list)
@@ -34,6 +41,23 @@ class ParseRequest(BaseModel):
             if ev.time_ms > self.end_ms:
                 raise ValueError(
                     f"events[{i}].time_ms ({ev.time_ms}) exceeds end_ms ({self.end_ms})"
+                )
+        return self
+
+
+class AlignRequest(ParseRequest):
+    """Practice alignment request: the same events/end_ms payload plus the
+    reference score and a non-negative alignment tolerance."""
+
+    reference_notes: List[ReferenceNoteIn] = Field(default_factory=list)
+    tolerance_ms: int = Field(ge=0, description="Maximum |played - reference| gap, in milliseconds, allowed for a pair")
+
+    @model_validator(mode="after")
+    def _reference_times_within_end(self) -> "AlignRequest":
+        for i, note in enumerate(self.reference_notes):
+            if note.time_ms > self.end_ms:
+                raise ValueError(
+                    f"reference_notes[{i}].time_ms ({note.time_ms}) exceeds end_ms ({self.end_ms})"
                 )
         return self
 
@@ -57,3 +81,26 @@ class ParseResponse(BaseModel):
     end_ms: int
     note_count: int
     notes: List[NoteOut]
+
+
+class AlignmentPairOut(BaseModel):
+    """One matched reference/played note pair."""
+
+    reference_index: int = Field(description="Index of the matched note in reference_notes")
+    event_index: int = Field(description="Index of the matched note_on in the submitted events array")
+    time_delta_ms: int = Field(
+        description="Signed onset deviation: played time minus reference time; positive means late, negative early"
+    )
+
+
+class AlignResponse(BaseModel):
+    end_ms: int
+    tolerance_ms: int
+    pair_count: int
+    missed_count: int = Field(description="Number of reference notes never played (漏弹)")
+    extra_count: int = Field(description="Number of note_on events with no reference counterpart (多弹)")
+    pairs: List[AlignmentPairOut] = Field(description="Matched pairs, ordered by reference_index")
+    missed_reference_indices: List[int] = Field(description="Reference notes with no played counterpart (漏弹)")
+    extra_event_indices: List[int] = Field(
+        description="Original event indices of unmatched note_on events (多弹), in played (time) order"
+    )
